@@ -1,17 +1,28 @@
 use std::sync::{Arc, RwLock};
 
-use super::scheduler::DiskManager;
+use super::{cache::Cache, scheduler::DiskManager};
 
+#[allow(unused)]
 pub struct BufferPoolManager {
+    // params
+    // @ max_frames     : max number of frames that can be held
+    //                    in the cache
+    // @ disc_manager   : Reference to the DiskManager
+    // @ cache          : reference to the LRU cache
+    max_frames: usize,
     disc_manager: Arc<RwLock<DiskManager>>,
+    cache: Arc<RwLock<Cache>>,
 }
 
 impl BufferPoolManager {
-    pub fn new(num_frames: usize, db_file: &str) -> BufferPoolManager {
-        let disk_manager = DiskManager::new(db_file.clone());
+    pub fn new(max_frames: usize, db_file: &str) -> BufferPoolManager {
+        let disk_manager = DiskManager::new(max_frames, db_file);
+        let cache = Cache::new(max_frames);
 
         BufferPoolManager {
+            max_frames,
             disc_manager: Arc::new(RwLock::new(disk_manager)),
+            cache: Arc::new(RwLock::new(cache)),
         }
     }
 }
@@ -60,10 +71,36 @@ mod test {
             .unwrap_or_else(|_| panic!("failed to open {}", FILE_PATH));
 
         let file_size = file.metadata().unwrap().len();
-        println!("[DEBUG] new page alloc -> filesize {file_size}");
+        println!("[TEST][DEBUG][BPM] new page alloc -> filesize {file_size}");
 
         assert_eq!(file_size, FRAME_SIZE);
 
-        // fs::remove_file(FILE_PATH).unwrap();
+        fs::remove_file(FILE_PATH).unwrap();
+    }
+
+    #[test]
+    fn test_multiple_page_creations() {
+        const FILE_PATH: &str = "/tmp/test_multiple_page_creations.db";
+        let _ = fs::remove_file(FILE_PATH);
+
+        let bpm = BufferPoolManager::new(3, FILE_PATH);
+
+        let mut writer = bpm.disc_manager.write().unwrap();
+        writer.new_page();
+        writer.new_page();
+        writer.new_page();
+        drop(writer);
+
+        let file = OpenOptions::new()
+            .read(true)
+            .open(FILE_PATH)
+            .unwrap_or_else(|_| panic!("failed to open {}", FILE_PATH));
+
+        let file_size = file.metadata().unwrap().len();
+        println!("[TEST][DEBUG][BPM] new page alloc -> filesize {file_size}");
+
+        assert_eq!(file_size, 12288);
+
+        fs::remove_file(FILE_PATH).unwrap();
     }
 }
