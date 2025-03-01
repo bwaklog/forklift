@@ -1,10 +1,16 @@
-use std::{collections::HashMap, fmt::Display, ptr, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    ptr,
+    sync::{Arc, RwLock},
+};
 
 use crate::storage::page::{Frame, PageID, FRAME_SIZE};
 
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
-    frame: Arc<Frame>,
+    page_id: PageID,
+    frame: Arc<RwLock<Frame>>,
     prev: *mut CacheEntry,
     next: *mut CacheEntry,
 }
@@ -12,7 +18,8 @@ pub struct CacheEntry {
 impl CacheEntry {
     fn new(frame: Frame) -> CacheEntry {
         CacheEntry {
-            frame: Arc::new(frame),
+            page_id: frame.page_id,
+            frame: Arc::new(RwLock::new(frame)),
             prev: ptr::null_mut(),
             next: ptr::null_mut(),
         }
@@ -23,30 +30,21 @@ impl CacheEntry {
 pub struct Cache {
     // Using a Heap to implement an
     // LRU-K cache
-    pub frames: Vec<Arc<Frame>>,
     pub max_frames: usize,
     // Hashmap and DLL based LRU
-    map: HashMap<PageID, Box<CacheEntry>>,
 
+    // NOTE: a lookup on this hashmap with the key, the value
+    // is a Box pointers, which is later casted to a raw pointer
+    // to get its position in the linked list to move it around
+    // in the cache
+    map: HashMap<PageID, *mut CacheEntry>,
     head: *mut CacheEntry,
     tail: *mut CacheEntry,
-}
-
-impl Display for Cache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let disp: Vec<(u32, usize, bool)> = self
-            .frames
-            .iter()
-            .map(|frame| (frame.page_id, frame.offset, frame.dirty))
-            .collect();
-        write!(f, "{:?}", disp)
-    }
 }
 
 impl Cache {
     pub fn new(max_frames: usize) -> Cache {
         Cache {
-            frames: Vec::with_capacity(max_frames),
             max_frames,
             map: HashMap::new(),
             head: ptr::null_mut(),
@@ -54,157 +52,116 @@ impl Cache {
         }
     }
 
-    pub fn lookup_frame(&mut self, page_id: PageID) -> Option<Arc<Frame>> {
+    pub fn lookup_frame(&mut self, page_id: PageID) -> Option<Arc<RwLock<Frame>>> {
         let entry = self.map.get(&page_id);
 
         if entry.is_none() {
+            println!("[DEBUG][CACHE] cache miss");
             return None;
         }
 
-        let entry_ptr = Box::into_raw(Box::clone(&entry.unwrap()));
-        let entry_derf = *entry.unwrap().clone();
+        println!("[DEBUG][CACHE] cache hit");
+
+        let entry_ptr = *(entry.unwrap());
 
         unsafe {
-            if entry_ptr != self.head || entry_ptr != self.tail {
-                (*(*entry_ptr).prev).next = (*entry_ptr).next;
-                (*(*entry_ptr).next).prev = (*entry_ptr).prev;
+            let prev = (*entry_ptr).prev;
+            let next = (*entry_ptr).next;
 
-                (*(self.tail)).next = entry_ptr;
-                (*entry_ptr).prev = self.tail;
-                (*(self.head)).prev = entry_ptr;
+            if !prev.is_null() && !next.is_null() {
+                (*prev).next = next;
+                (*next).prev = prev;
+
+                (*self.head).prev = entry_ptr;
                 (*entry_ptr).next = self.head;
-
                 self.head = entry_ptr;
+                (*self.head).prev = ptr::null_mut();
+            } else if !prev.is_null() && next.is_null() {
+                (*prev).next = ptr::null_mut();
+                self.tail = prev;
+
+                (*self.head).prev = entry_ptr;
+                (*entry_ptr).next = self.head;
+                self.head = entry_ptr;
+                (*self.head).prev = ptr::null_mut();
             }
         }
 
-        Some(entry_derf.frame)
+        test_iter(self.head);
+
+        unsafe {
+            return Some(Arc::clone(&(*entry_ptr).frame));
+        }
     }
 
     pub fn put_frame(
         &mut self,
         page_id: PageID,
         offset: usize,
-        content: Arc<[u8; FRAME_SIZE as usize]>,
+        content: Box<[u8; FRAME_SIZE as usize]>,
     ) {
         if self.map.len() + 1 > self.max_frames {
-            let key = unsafe { (*(self.tail)).frame.page_id };
-            self.map.remove(&key).unwrap();
-            let frame: Arc<Frame>;
             unsafe {
                 let entry = self.tail;
-                frame = Arc::clone(&(*entry).frame);
 
-                let prev = (*(self.tail)).prev;
-
-                if entry == prev {
+                if !entry.is_null() && ((*entry).next == (*entry).prev) {
+                    // one element
                     self.head = ptr::null_mut();
                     self.tail = ptr::null_mut();
-                } else {
-                    (*prev).next = self.head;
-                    (*self.head).prev = prev;
-                    self.tail = prev;
+                } else if !entry.is_null() {
+                    self.tail = (*entry).prev;
+                    (*self.tail).next = ptr::null_mut();
                 }
+
+                let key = (*(entry)).page_id;
+                let mut frame = Arc::clone(&(*self.map.remove(&key).unwrap()).frame);
+                frame = Arc::clone(&frame);
+                println!("[DEBUG][CACHE] Evicting frame {}", frame.read().unwrap());
             }
-            println!("evicting frame {}", frame);
         }
 
-        let entry = Box::new(CacheEntry::new(Frame::new(
-            page_id,
-            offset,
-            content.clone(),
-        )));
-        self.map.insert(page_id, entry.clone());
-        unsafe {
-            let entry_ptr = Box::into_raw(entry);
+        let entry = Box::new(CacheEntry::new(Frame::new(page_id, offset, content)));
 
+        let entry_ptr = Box::into_raw(entry);
+
+        unsafe {
             if self.tail.is_null() {
                 self.tail = entry_ptr;
                 self.head = entry_ptr;
-
-                (*entry_ptr).next = entry_ptr;
-                (*entry_ptr).prev = entry_ptr;
             } else {
-                (*self.tail).next = entry_ptr;
-                (*entry_ptr).prev = self.tail;
-                (*self.head).prev = entry_ptr;
                 (*entry_ptr).next = self.head;
-
+                (*self.head).prev = entry_ptr;
                 self.head = entry_ptr;
             }
+
+            self.map.insert(page_id, entry_ptr);
+            // dbg!(&self
+            //     .map
+            //     .values()
+            //     .map(|val| (val.frame.page_id, val.prev, val.next))
+            //     .collect::<Vec<_>>());
         }
 
-        unsafe {
-            let start = self.head;
-            let mut ptr = start;
-
-            println!("\thead: {}", (*ptr).frame);
-            ptr = (*ptr).next;
-
-            loop {
-                if ptr == start {
-                    break;
-                }
-                println!("\tnode: {}", (*ptr).frame);
-                ptr = (*ptr).next;
-            }
-        }
-
-        // if self.frames.len() == self.max_frames && !self.frames.is_empty() {
-        //     // LRU-K
-        //     // we evict a chosen dirty frame to the disc
-        //     // to make space for the new frame
-        //     let _evict = self.frames.last().unwrap();
-        //
-        //     let len = self.frames.len();
-        //     let frame = Frame::new(page_id, offset, content);
-        //     self.frames[len - 1] = Arc::new(frame);
-        //
-        //     heapify_up(&mut self.frames, len - 1, self.max_frames);
-        //     // we evict here
-        // } else {
-        //     let frame = Frame::new(page_id, offset, content);
-        //     self.frames.push(Arc::new(frame));
-        //     let len = self.frames.len();
-        //
-        //     heapify_up(&mut self.frames, len - 1, self.max_frames);
-        // }
-
-        // println!("[DEBUG][Cache] {}", self);
+        test_iter(self.head);
     }
 }
 
-// fn right_child_index(index: usize, bounds: usize) -> usize {
-//     todo!()
-// }
-//
-// fn left_child_index(index: usize, bounds: usize) -> usize {
-//     todo!()
-// }
-//
-// fn parent_index(index: usize, bounds: usize) -> usize {
-//     if index == 0 {
-//         return 0;
-//     }
-//
-//     if index >= bounds {
-//         panic!("invalid index in heap")
-//     }
-//
-//     (index - 1) / 2
-// }
-//
-// fn heapify_up(heap: &mut [Arc<Frame>], index: usize, capacity: usize) {
-//     let mut cur = index;
-//     loop {
-//         if cur == 0 {
-//             break;
-//         }
-//
-//         let parent = parent_index(cur, capacity);
-//         heap.swap(cur, parent);
-//         cur = parent;
-//     }
-// }
-//
-// fn heapify_down(heap: &mut [Arc<Frame>]) {}
+fn test_iter(head: *mut CacheEntry) {
+    unsafe {
+        let start = head;
+        let mut ptr = start;
+
+        loop {
+            if ptr.is_null() {
+                break;
+            }
+            println!(
+                "\tnode: {}, prev {:?}, next {:?}",
+                (*ptr).page_id,
+                (*ptr).prev,
+                (*ptr).next
+            );
+            ptr = (*ptr).next;
+        }
+    }
+}

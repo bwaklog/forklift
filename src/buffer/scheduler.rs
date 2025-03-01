@@ -1,12 +1,14 @@
 use std::{
+    fmt,
     fs::{File, OpenOptions},
-    io::{BufReader, Read, Seek, SeekFrom},
-    sync::Arc,
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom},
+    ptr::write,
+    sync::{Arc, RwLock},
 };
 
 use crate::storage::{
     directory::PageDirector,
-    page::{PageID, FRAME_SIZE},
+    page::{Frame, PageID, FRAME_SIZE},
 };
 
 use super::cache::Cache;
@@ -19,6 +21,23 @@ pub struct DiskManager {
     page_directory: PageDirector,
     pub cache: Cache,
 }
+
+#[derive(Debug, Clone)]
+pub enum Error {
+    DeletePageError,
+    WritePageError,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Error::DeletePageError => write!(f, "Failed to perform operations to delete a page"),
+            Error::WritePageError => write!(f, "Failed to perform operations to write a page"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 impl DiskManager {
     pub fn new(max_frames: usize, db_file: &str) -> DiskManager {
@@ -48,11 +67,8 @@ impl DiskManager {
         }
     }
 
-    pub fn get_db_size(&self) -> u64 {
-        self.db_file
-            .metadata()
-            .expect("failed to read metadata for filesize")
-            .len()
+    pub fn size(self) -> usize {
+        self.cache.max_frames
     }
 
     pub fn new_page(&mut self) -> PageID {
@@ -82,20 +98,107 @@ impl DiskManager {
         assert_eq!(content.len(), FRAME_SIZE as usize);
 
         self.cache
-            .put_frame(registerd_page, offset, Arc::new(content));
+            .put_frame(registerd_page, offset, Box::new(content));
 
         registerd_page
     }
 
-    #[allow(unused)]
-    pub fn write_page(&mut self, page_id: PageID, bytes: &[u8; FRAME_SIZE as usize]) {
-        todo!()
+    /// TODO: proper error types
+    /// Remove page from disk and memory. Find all traces of the page
+    /// where it is being used and unallocate from memory
+    ///
+    /// once a page has been deleted, we need to ensure that its reference (offset)
+    /// is also removed from the page directory and appended to the list of free
+    /// slots that can be taken up by `DiskManager::new_page` the next time around
+    /// while allocating a new page
+    ///
+    /// todo: implement pins
+    pub fn delete_page(&mut self, page_id: PageID) -> Result<(), Box<dyn std::error::Error>> {
+        let query_page = self.page_directory.query_page(page_id);
+        if query_page.is_none() {
+            return Err(Box::new(Error::DeletePageError));
+        }
+
+        let page_dir_delte = self.page_directory.remove_page(page_id);
+        if page_dir_delte.is_err() {
+            return page_dir_delte;
+        }
+
+        Ok(())
     }
 
     #[allow(unused)]
-    pub fn read_page(&mut self, page_id: PageID) -> [u8; FRAME_SIZE as usize] {
-        self.cache.lookup_frame(page_id);
-        todo!()
+    pub fn write_page(
+        &mut self,
+        page_id: PageID,
+        bytes: Box<[u8; FRAME_SIZE as usize]>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // first check if a page is in memory or not
+        // the lookup will bring the frame to memory if not present
+        let frame = self.load_frame(page_id);
+
+        if frame.is_none() {
+            return Err(Box::new(Error::WritePageError));
+        }
+
+        let mut frame = frame.unwrap();
+        let mut handler = frame.write().unwrap();
+        handler.content = bytes;
+        handler.dirty = true;
+        drop(handler);
+
+        Ok(())
+    }
+
+    #[allow(unused)]
+    pub fn read_page(&mut self, page_id: PageID) -> Box<[u8; FRAME_SIZE as usize]> {
+        let frame = self.load_frame(page_id);
+
+        if frame.is_none() {
+            panic!("Failed to load frame");
+        }
+
+        let frame = frame.unwrap();
+
+        return Box::clone(&frame.read().unwrap().content);
+    }
+
+    fn load_frame(&mut self, page_id: PageID) -> Option<Arc<RwLock<Frame>>> {
+        if let Some(frame) = self.cache.lookup_frame(page_id) {
+            println!(
+                "[DEBUG][DiskManager][Cache] from cache page {}",
+                frame.read().unwrap()
+            );
+            return Some(frame);
+        }
+
+        println!("[DEBUG][DiskManager] fetching from disk for {}", page_id);
+        if let Some(offset) = self.page_directory.query_page(page_id) {
+            let mut reader = BufReader::new(&self.db_file);
+            reader.seek(SeekFrom::Start(offset as u64)).unwrap();
+
+            let mut content: [u8; FRAME_SIZE as usize] = [0; FRAME_SIZE as usize];
+            reader
+                .read_exact(&mut content)
+                .unwrap_or_else(|_| panic!("failed to read {FRAME_SIZE} from {offset}"));
+
+            println!("[DEBUG][DiskManager] fetched from disk");
+
+            println!("[DEBUG][DiskManager] updating cache");
+            self.cache.put_frame(page_id, offset, Box::new(content));
+
+            return self.cache.lookup_frame(page_id);
+        } else {
+            println!("frame not available on disk");
+            return None;
+        }
+    }
+
+    pub fn get_db_size(&self) -> u64 {
+        self.db_file
+            .metadata()
+            .expect("failed to read metadata for filesize")
+            .len()
     }
 }
 
