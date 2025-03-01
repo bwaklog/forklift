@@ -93,9 +93,38 @@ impl DiskManager {
     }
 
     #[allow(unused)]
-    pub fn read_page(&mut self, page_id: PageID) -> [u8; FRAME_SIZE as usize] {
-        self.cache.lookup_frame(page_id);
-        todo!()
+    pub fn read_page(&mut self, page_id: PageID) -> Arc<[u8; FRAME_SIZE as usize]> {
+        println!("[DEBUG][DiskManager] page {} requested", page_id);
+        if let Some(mem_frame) = self.cache.lookup_frame(page_id) {
+            let mem_lock = mem_frame.read().unwrap();
+            println!("[DEBUG][DiskManager][Cache] from cache page {}", mem_lock);
+
+            return Arc::clone(&mem_lock.content);
+        }
+
+        // open disc at offset
+        println!("[DEBUG][DiskManager] fetching from disk for {}", page_id);
+
+        if let Some(offset) = self.page_directory.query_page(page_id) {
+            let mut reader = BufReader::new(&self.db_file);
+            reader.seek(SeekFrom::Start(offset as u64)).unwrap();
+
+            let mut content: [u8; FRAME_SIZE as usize] = [0; FRAME_SIZE as usize];
+            reader
+                .read_exact(&mut content)
+                .unwrap_or_else(|_| panic!("failed to read {FRAME_SIZE} from {offset}"));
+
+            let heap_content = Arc::new(content);
+            println!("[DEBUG][DiskManager] fetched from disk");
+
+            println!("[DEBUG][DiskManager] updating cache");
+            self.cache
+                .put_frame(page_id, offset, Arc::clone(&heap_content));
+
+            return Arc::clone(&heap_content);
+        }
+
+        panic!("[WARN][DiskManager] panic if not found for now!!");
     }
 }
 

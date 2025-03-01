@@ -1,6 +1,6 @@
 use std::{collections::HashMap, vec};
 
-use super::page::{FRAME_SIZE, PageID};
+use super::page::{PageID, FRAME_SIZE};
 
 #[derive(Debug)]
 pub struct PageDirector {
@@ -33,6 +33,10 @@ impl PageDirector {
 
     pub fn current_mapsize(&self) -> usize {
         self.map.len() + self.free_slots.len()
+    }
+
+    pub fn query_page(&self, page_id: PageID) -> Option<usize> {
+        self.map.get(&page_id).copied()
     }
 
     pub fn register_new_page(&mut self) -> (PageID, usize) {

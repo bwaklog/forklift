@@ -5,7 +5,7 @@
 // each individual page is supposed to be self
 // contained
 
-use std::{fmt::Display, sync::Arc};
+use std::{fmt::Display, io::Read, sync::Arc};
 
 pub type PageID = u32;
 pub const FRAME_SIZE: u64 = 4096; // 4KB frame size
@@ -19,7 +19,8 @@ pub struct Frame {
     pub page_id: PageID,
     pub dirty: bool,
     pub offset: usize,
-    content: Arc<[u8; FRAME_SIZE as usize]>,
+    pub cursor: usize,
+    pub content: Arc<[u8; FRAME_SIZE as usize]>,
 }
 
 impl Display for Frame {
@@ -38,7 +39,18 @@ impl Frame {
             page_id,
             offset,
             content,
+            cursor: 0,
             dirty: false,
         }
+    }
+}
+
+impl Read for Frame {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let buf_len = buf.len();
+        let read_available = FRAME_SIZE as usize - self.cursor;
+        buf.copy_from_slice(&self.content.as_slice()[self.cursor..]);
+
+        Ok(read_available)
     }
 }
