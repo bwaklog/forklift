@@ -1,9 +1,9 @@
 use std::{
     fmt,
     fs::{File, OpenOptions},
-    io::{BufReader, BufWriter, Read, Seek, SeekFrom},
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     ptr::write,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use crate::storage::{
@@ -26,13 +26,15 @@ pub struct DiskManager {
 pub enum Error {
     DeletePageError,
     WritePageError,
+    CacheFetchMiss,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Error::DeletePageError => write!(f, "Failed to perform operations to delete a page"),
-            Error::WritePageError => write!(f, "Failed to perform operations to write a page"),
+            Self::DeletePageError => write!(f, "Failed to perform operations to delete a page"),
+            Self::WritePageError => write!(f, "Failed to perform operations to write a page"),
+            Self::CacheFetchMiss => write!(f, "Frame flush requested is not in cache"),
         }
     }
 }
@@ -97,8 +99,12 @@ impl DiskManager {
 
         assert_eq!(content.len(), FRAME_SIZE as usize);
 
-        self.cache
+        let evict = self
+            .cache
             .put_frame(registerd_page, offset, Box::new(content));
+        if let Some(frame) = evict {
+            let _ = self.flush_frame(frame);
+        }
 
         registerd_page
     }
@@ -135,13 +141,14 @@ impl DiskManager {
     ) -> Result<(), Box<dyn std::error::Error>> {
         // first check if a page is in memory or not
         // the lookup will bring the frame to memory if not present
-        let frame = self.load_frame(page_id);
+        let mut frame = self.load_frame(page_id);
 
         if frame.is_none() {
             return Err(Box::new(Error::WritePageError));
         }
 
-        let mut frame = frame.unwrap();
+        let frame = frame.unwrap();
+
         let mut handler = frame.write().unwrap();
         handler.content = bytes;
         handler.dirty = true;
@@ -161,6 +168,45 @@ impl DiskManager {
         let frame = frame.unwrap();
 
         return Box::clone(&frame.read().unwrap().content);
+    }
+
+    /// Method flushes dirty pages (pages that have been modified)
+    /// to disk safely, while having a lock on the frame
+    pub fn flush_page(&mut self, page_id: PageID) -> Result<(), Box<dyn std::error::Error>> {
+        let frame = self.cache.lookup_frame(page_id);
+        if frame.is_none() {
+            return Err(Box::new(Error::CacheFetchMiss));
+        }
+
+        let frame = frame.unwrap();
+        let mut writer = BufWriter::new(&self.db_file);
+        let handler = frame.write().unwrap();
+
+        writer.seek(SeekFrom::Start(handler.offset as u64)).unwrap();
+        writer.write_all(&*handler.content).unwrap();
+        writer.flush().unwrap();
+
+        drop(writer);
+        drop(handler);
+
+        Ok(())
+    }
+
+    pub fn flush_frame(
+        &mut self,
+        frame: Arc<RwLock<Frame>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut writer = BufWriter::new(&self.db_file);
+        let handler = frame.read().unwrap();
+
+        writer.seek(SeekFrom::Start(handler.offset as u64)).unwrap();
+        writer.write_all(&*handler.content).unwrap();
+        writer.flush().unwrap();
+
+        drop(writer);
+        drop(handler);
+        drop(frame); // free from memory
+        Ok(())
     }
 
     fn load_frame(&mut self, page_id: PageID) -> Option<Arc<RwLock<Frame>>> {
@@ -185,7 +231,11 @@ impl DiskManager {
             println!("[DEBUG][DiskManager] fetched from disk");
 
             println!("[DEBUG][DiskManager] updating cache");
-            self.cache.put_frame(page_id, offset, Box::new(content));
+            let evict = self.cache.put_frame(page_id, offset, Box::new(content));
+            if let Some(frame) = evict {
+                println!("flushing frame {}", frame.read().unwrap().page_id);
+                let _ = self.flush_frame(frame);
+            }
 
             return self.cache.lookup_frame(page_id);
         } else {

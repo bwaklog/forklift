@@ -94,12 +94,52 @@ impl Cache {
         }
     }
 
+    pub fn evict_frame(&mut self, page_id: PageID) {
+        let entry = self.map.get(&page_id);
+
+        if entry.is_none() {
+            println!("[DEBUG][CACHE] cache miss");
+            return;
+        }
+
+        let entry_ptr = *(entry.unwrap());
+
+        unsafe {
+            let prev = (*entry_ptr).prev;
+            let next = (*entry_ptr).next;
+
+            if !prev.is_null() && !next.is_null() {
+                (*prev).next = next;
+                (*next).prev = prev;
+
+                (*self.head).prev = entry_ptr;
+                (*entry_ptr).next = self.head;
+                self.head = entry_ptr;
+                (*self.head).prev = ptr::null_mut();
+            } else if !prev.is_null() && next.is_null() {
+                (*prev).next = ptr::null_mut();
+                self.tail = prev;
+
+                (*self.head).prev = entry_ptr;
+                (*entry_ptr).next = self.head;
+                self.head = entry_ptr;
+                (*self.head).prev = ptr::null_mut();
+            }
+        }
+    }
+
+    /// Adds a frame with specified page_id, memory offset,
+    /// content to the cahce
+    /// The return value is an Option<Arc<..>> reference to the
+    /// frame being evicted
     pub fn put_frame(
         &mut self,
         page_id: PageID,
         offset: usize,
         content: Box<[u8; FRAME_SIZE as usize]>,
-    ) {
+    ) -> Option<Arc<RwLock<Frame>>> {
+        let mut evict: Option<Arc<RwLock<Frame>>> = None;
+
         if self.map.len() + 1 > self.max_frames {
             unsafe {
                 let entry = self.tail;
@@ -116,6 +156,7 @@ impl Cache {
                 let key = (*(entry)).page_id;
                 let mut frame = Arc::clone(&(*self.map.remove(&key).unwrap()).frame);
                 frame = Arc::clone(&frame);
+                evict = Some(frame.clone());
                 println!("[DEBUG][CACHE] Evicting frame {}", frame.read().unwrap());
             }
         }
@@ -143,6 +184,8 @@ impl Cache {
         }
 
         test_iter(self.head);
+
+        return evict;
     }
 }
 

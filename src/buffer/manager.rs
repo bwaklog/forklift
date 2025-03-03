@@ -9,7 +9,7 @@ pub struct BufferPoolManager {
     /// params
     /// max_frames     : max number of frames that can be held
     ///                  in the cache
-    /// disc_manager   : Reference to the DiskManager
+    /// disk_manager   : Reference to the DiskManager
     max_frames: usize,
     pub disk_manager: Arc<Mutex<DiskManager>>,
 }
@@ -37,11 +37,11 @@ impl BufferPoolManager {
         self.disk_manager.lock().unwrap().delete_page(page_id)
     }
 
-    pub fn flush_page_unsafe(page_id: PageID) {
+    pub fn flush_page_unsafe(page_id: PageID) -> Result<(), Box<dyn std::error::Error>> {
         unimplemented!()
     }
 
-    pub fn flush_page(page_id: PageID) {
+    pub fn flush_page(page_id: PageID) -> Result<(), Box<dyn std::error::Error>> {
         unimplemented!()
     }
 
@@ -201,5 +201,52 @@ mod test {
             frame.iter().map(|v| v.to_owned() as u64).sum::<u64>(),
             FRAME_SIZE
         )
+    }
+
+    #[test]
+    fn test_single_page_flush() {
+        const FILE_PATH: &str = "/tmp/test_single_page_flush.db";
+        let _ = fs::remove_dir(FILE_PATH);
+
+        let mut bpm = BufferPoolManager::new(1, FILE_PATH);
+        bpm.new_page();
+
+        let new_frame = Box::new([1; FRAME_SIZE as usize]);
+        let write_res = bpm.disk_manager.lock().unwrap().write_page(1, new_frame);
+        assert_eq!(write_res.is_err(), false);
+
+        dbg!(
+            bpm.disk_manager
+                .lock()
+                .unwrap()
+                .cache
+                .lookup_frame(1)
+                .unwrap()
+                .read()
+                .unwrap()
+                .content
+                .iter()
+                .map(|v| v.to_owned() as u64)
+                .sum::<u64>(),
+            FRAME_SIZE
+        );
+
+        bpm.new_page();
+
+        assert_eq!(
+            bpm.disk_manager
+                .lock()
+                .unwrap()
+                .cache
+                .lookup_frame(2)
+                .is_none(),
+            false
+        );
+
+        let read_res = bpm.disk_manager.lock().unwrap().read_page(1);
+        assert_eq!(
+            read_res.iter().map(|v| v.to_owned() as u64).sum::<u64>(),
+            FRAME_SIZE
+        );
     }
 }
